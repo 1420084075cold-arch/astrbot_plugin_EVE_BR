@@ -4,7 +4,6 @@ from astrbot.api import logger
 import requests
 import time
 import threading
-import json
 from typing import Dict, Set, List, Optional
 
 @register("EveKillmail", "YourName", "EVE Online 击杀邮件订阅插件", "1.0.0")
@@ -25,8 +24,6 @@ class KillmailPlugin(Star):
         # API配置
         self.ZKILL_API = "https://zkillboard.com/api"
         self.ZKILL_URL = "https://zkillboard.com/kill"
-        
-        # 使用 fuzzwork 作为备选搜索API
         self.FUZZWORK_API = "https://www.fuzzwork.co.uk/api"
         
         # 高价值击杀阈值 (10B ISK)
@@ -39,6 +36,29 @@ class KillmailPlugin(Star):
     async def terminate(self):
         self.stop_monitoring()
         logger.info("击杀邮件订阅插件已卸载")
+
+    # ==================== 获取群组ID的辅助方法 ====================
+    
+    def get_group_id(self, event: AstrMessageEvent) -> str:
+        """安全获取群组ID"""
+        # 方法1: 直接获取 group_id
+        if hasattr(event, 'group_id') and event.group_id:
+            return str(event.group_id)
+        
+        # 方法2: 从 session_id 获取（群聊时 session_id 通常是群号）
+        if hasattr(event, 'get_session_id'):
+            session_id = event.get_session_id()
+            if session_id:
+                return str(session_id)
+        
+        # 方法3: 从 message_obj 获取
+        if hasattr(event, 'message_obj'):
+            msg_obj = event.message_obj
+            if hasattr(msg_obj, 'group_id') and msg_obj.group_id:
+                return str(msg_obj.group_id)
+        
+        # 方法4: 默认返回 "private" 表示私聊
+        return "private"
 
     # ==================== 监控线程 ====================
     
@@ -89,7 +109,6 @@ class KillmailPlugin(Star):
     def search_corporation(self, name: str) -> Optional[dict]:
         """通过 fuzzwork 搜索军团"""
         try:
-            # 方法1: 使用 fuzzwork 搜索
             url = f"{self.FUZZWORK_API}/corporationID.php"
             params = {"corporation": name}
             resp = requests.get(url, params=params, timeout=10)
@@ -99,18 +118,6 @@ class KillmailPlugin(Star):
                     return {"id": int(corp_id), "name": name, "type": "corporation"}
         except Exception as e:
             logger.debug(f"fuzzwork 搜索失败: {e}")
-        
-        # 方法2: 使用 zKillboard 搜索
-        try:
-            url = f"{self.ZKILL_API}/corporationID/{name}/"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data and len(data) > 0:
-                    return {"id": data[0].get("corporationID"), "name": name, "type": "corporation"}
-        except Exception as e:
-            logger.debug(f"zKillboard 搜索失败: {e}")
-        
         return None
     
     def search_alliance(self, name: str) -> Optional[dict]:
@@ -295,14 +302,17 @@ class KillmailPlugin(Star):
         asyncio.create_task(self._send_message(group_id, message))
     
     async def _send_message(self, group_id: str, message: str):
+        """异步发送消息"""
         try:
-            group_id_int = int(group_id) if group_id != "default" else None
-            
-            if group_id_int:
+            # 如果是私聊，使用不同的发送方式
+            if group_id == "private":
+                # 私聊消息的发送方式，根据实际情况调整
+                logger.info(f"[私聊] {message[:100]}...")
+            else:
+                # 群聊消息
+                group_id_int = int(group_id)
                 await self.context.send_group_message(group_id_int, message)
                 logger.info(f"消息已发送到群组 {group_id_int}")
-            else:
-                logger.info(f"[模拟发送] {message[:100]}...")
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
 
@@ -310,6 +320,7 @@ class KillmailPlugin(Star):
     
     @filter.command(".sub")
     async def subscribe(self, event: AstrMessageEvent):
+        """订阅击杀邮件"""
         content = event.message_str.strip()
         parts = content.split()
         
@@ -328,7 +339,9 @@ class KillmailPlugin(Star):
             )
             return
         
-        group_id = str(event.group_id) if event.group_id else str(event.get_session_id())
+        # 使用安全的方法获取群组ID
+        group_id = self.get_group_id(event)
+        logger.info(f"订阅命令来自: {group_id}")
         
         if group_id not in self.subscriptions:
             self.subscriptions[group_id] = set()
@@ -338,7 +351,7 @@ class KillmailPlugin(Star):
         
         if command == "list":
             if not subs:
-                yield event.plain_result("当前群组没有订阅")
+                yield event.plain_result("当前对话没有订阅")
             else:
                 lines = ["📋 **当前订阅列表**:", ""]
                 for sub in subs:
@@ -397,6 +410,7 @@ class KillmailPlugin(Star):
     
     @filter.command(".unsub")
     async def unsubscribe(self, event: AstrMessageEvent):
+        """取消订阅"""
         content = event.message_str.strip()
         parts = content.split()
         
@@ -404,10 +418,10 @@ class KillmailPlugin(Star):
             yield event.plain_result("用法: .unsub corp/alliance/player/player_kill/player_loss/high_value [ID]")
             return
         
-        group_id = str(event.group_id) if event.group_id else str(event.get_session_id())
+        group_id = self.get_group_id(event)
         
         if group_id not in self.subscriptions:
-            yield event.plain_result("当前群组没有订阅")
+            yield event.plain_result("当前对话没有订阅")
             return
         
         command = parts[1].lower()
@@ -442,11 +456,7 @@ class KillmailPlugin(Star):
     
     @filter.command(".search")
     async def search(self, event: AstrMessageEvent):
-        """搜索军团/联盟/玩家
-        
-        用法: .search [名称]
-        示例: .search Goonswarm
-        """
+        """搜索军团/联盟/玩家"""
         content = event.message_str.strip()
         parts = content.split()
         
@@ -459,17 +469,14 @@ class KillmailPlugin(Star):
         
         results = []
         
-        # 1. 搜索军团
         corp = self.search_corporation(search_name)
         if corp:
             results.append(corp)
         
-        # 2. 搜索联盟
         alliance = self.search_alliance(search_name)
         if alliance:
             results.append(alliance)
         
-        # 3. 搜索角色
         character = self.search_character(search_name)
         if character:
             results.append(character)
@@ -508,6 +515,7 @@ class KillmailPlugin(Star):
     
     @filter.command(".killinfo")
     async def kill_info(self, event: AstrMessageEvent):
+        """查看击杀详情"""
         content = event.message_str.strip()
         parts = content.split()
         
@@ -521,9 +529,11 @@ class KillmailPlugin(Star):
     @filter.command(".test")
     async def test(self, event: AstrMessageEvent):
         """测试插件是否正常工作"""
+        group_id = self.get_group_id(event)
         yield event.plain_result(
-            "✅ 击杀邮件插件正常运行！\n\n"
-            "📋 可用命令:\n"
+            f"✅ 击杀邮件插件正常运行！\n\n"
+            f"📋 当前对话ID: {group_id}\n\n"
+            "可用命令:\n"
             ".search [名称] - 搜索军团/联盟/玩家\n"
             ".sub corp/alliance/player [ID] - 订阅\n"
             ".sub list - 查看订阅\n"
